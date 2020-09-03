@@ -58,14 +58,49 @@ class scriptDB:
                 #print(data_field[x])
                 if "\n" in str(data_field[x]):
                     data[data_header[x]] = data_field[x].split("\n")
-                    if data_header[x] == "redistribute":
-                        data[data_header[x]] = [ tuple(x.split(",")) for x in data[data_header[x]] if "," in x ]
+                    if data_header[x] == "vrf_redistribute":
+                        data[data_header[x]] = [ tuple(x.split(",")) for x in data[data_header[x]]]
                     elif data_header[x] == "neighbor_as":
                         data[data_header[x]] = [ int(x) for x in data[data_header[x]] ]
                 else:
                     data[data_header[x]] = data_field[x]
             bgp_consol_data.append(data)
         return bgp_consol_data
+    
+    def vrfDB(self):
+        ws = self.wb["vrf"]
+        data_header = [ cell.value for cell in ws[1] ]
+        current_row = ws.max_row
+        vrf_data = list()
+        for row in range(2, current_row+1):
+            data = dict()
+            data_record = [ cell.value for cell in ws[row] ]
+            for x in range(len(data_header)):
+                if data_header[x] == "rt_export" or data_header[x] == "rt_import":
+                    data[data_header[x]] = data_record[x].splitlines()
+                else:
+                    data[data_header[x]] = data_record[x]
+            vrf_data.append(data)
+        return vrf_data
+
+    def portMigrationDB(self):
+        ws = self.wb["port_migration"]
+        data_header = [ cell.value for cell in ws[1] ]
+        current_row = ws.max_row
+        port_data = list()
+        for row in range(2, current_row+1):
+            data = dict()
+            data_record = [ cell.value for cell in ws[row] ]
+            for x in range(len(data_header)):
+                if data_header[x] == "member_port_A" or data_header[x] == "vlan_port_A":
+                    if data_record[x] != None:
+                        data[data_header[x]] = data_record[x].splitlines()
+                    else:
+                        data[data_header[x]] = None
+                else:
+                    data[data_header[x]] = data_record[x]
+            port_data.append(data)
+        return port_data
 
 class scriptGenerator:
     def __init__(self):
@@ -107,23 +142,38 @@ class scriptGenerator:
         router bgp {{ data_field["node_A_as"] }}
         '''
         self.bgp_template = '''
-        {%- if data_field["vrf"] != Global %}
+        {%- if data_field["vrf"] != "Global" %}
          address-family ipv4 vrf {{ data_field["vrf"] }}
           neighbor {{ data_field["node_B_ip"] }} remote-as {{ data_field["node_B_as"] }}
           neighbor {{ data_field["node_B_ip"] }} activate
           neighbor {{ data_field["node_B_ip"] }} description to_{{ data_field["node_B"] }}_{{ data_field["vrf"] }}
           neighbor {{ data_field["node_B_ip"] }} send-community extended
          exit-address-family
+        {%- else %}
+         neighbor {{ data_field["node_B_ip"] }} remote-as {{ data_field["node_B_as"] }}
+         {%- if data_field["node_A_local_as"] == "yes" %} 
+         neighbor {{ data_field["node_B_ip"] }} local-as {{ data_field["node_B_as"] }}
+         neighbor {{ data_field["node_B_ip"] }} update-source loopback0
+         {%- endif %}
+         neighbor {{ data_field["node_B_ip"] }} description to_{{ data_field["node_B"] }}
+         neighbor {{ data_field["node_B_ip"] }} fall-over bfd
         {%- endif %}
         '''
         self.bgp_consol_template = '''
+        no router bgp {{ data_field["node_A_old_as"] }}
         router bgp {{ data_field["node_A_as"] }}
+         {%- if data_field["node_A_routerid"] != None %}
          bgp router-id {{ data_field["node_A_routerid"] }}
          no bgp default ipv4-unicast
-         {%- for neighbor, neighbor_ip, remote_as in neighbors %}
+         {%- endif %}
+         {%- for neighbor, neighbor_ip, remote_as, local_as in neighbors %}
          neighbor {{ neighbor_ip }} remote-as {{ remote_as }}
          neighbor {{ neighbor_ip }} description {{ neighbor }}
+         neighbor {{ neighbor_ip }} fall-over bfd
          {%- if data_field["node_A_as"] == remote_as %}
+         neighbor {{ neighbor_ip }} update-source loopback0
+         {%- elif local_as == "yes" %}
+         neighbor {{ neighbor_ip }} local-as {{ remote_as }}
          neighbor {{ neighbor_ip }} update-source loopback0
          {%- endif %}
          {%- endfor %}
@@ -144,6 +194,36 @@ class scriptGenerator:
          exit-address-family
          !
          {%- endfor %}
+        '''
+        self.vrf_template = '''
+        vrf definition {{ data["vrf_name"]}}
+        {%- if data["rd"] != None %}
+         rd {{ data["rd"] }}
+        {%- endif %}
+         address-family ipv4
+         {%- for export in data["rt_export"] %}
+          route-target export {{ export }}
+         {%- endfor %}
+         {%- for import in data["rt_import"] %}
+          route-target import {{ import }}
+         {%- endfor %}
+         exit-address-family
+        '''
+        self.port_template = '''
+        interface {{ data["port_A"] }}
+         shutdown
+        {%- if data["member_port_A"] != None %}
+        {%- for member in data["member_port_A"] %}
+        interface {{ member }}
+         shutdown
+        {%- endfor %}
+        {% endif %}
+        {%- if data["vlan_port_A"] != None %}
+        {%- for member in data["vlan_port_A"] %}
+        interface {{ member }}
+         shutdown
+        {%- endfor %}
+        {%- endif %}
         '''
 
     def interconnect(self, interconnect):
@@ -177,22 +257,35 @@ class scriptGenerator:
         data = {
             "data_field" : bgp_consol,
             "vpnv4_address_family" : tuple(zip(bgp_consol["neighbor_ip"], bgp_consol["vpnv4"])),
-            "ipv4_address_family" : tuple(zip(bgp_consol["vrf"], bgp_consol["redistribute"])),
-            "neighbors" : tuple(zip(bgp_consol["node_A_neighbor"], bgp_consol["neighbor_ip"], bgp_consol["neighbor_as"]))
+            "neighbors" : tuple(zip(bgp_consol["node_A_neighbor"], bgp_consol["neighbor_ip"], bgp_consol["neighbor_as"], bgp_consol["local_as"]))
         }
+        if  bgp_consol["vrf"] != None and bgp_consol["vrf_redistribute"] != None:
+            data["ipv4_address_family"] = tuple(zip(bgp_consol["vrf"], bgp_consol["vrf_redistribute"]))
         # vpnv4_address_family = tuple(zip(bgp_consol["neighbor_ip"], bgp_consol["vpnv4"]))
         # ipv4_address_family = tuple(zip(bgp_consol["vrf"], bgp_consol["redistribute"]))
         # neighbors = tuple(zip(bgp_consol["node_A_neighbor"], bgp_consol["neighbor_ip"], bgp_consol["neighbor_as"]))
         result = bgp_consolidation_template.render(**data)
         return result
+    
+    def vrf(self, vrf):
+        vrf_template = Template(self.vrf_template)
+        result = vrf_template.render(data=vrf)
+        return result
+    
+    def port_migration(self, port_migration):
+        port_template = Template(self.port_template)
+        result = port_template.render(data=port_migration)
+        return result
 
 class xportMop:
-    def __init__(self, interconnect=[], ospf=[], bgp=[], bgp_consolidation=[]):
+    def __init__(self, interconnect=[], ospf=[], bgp=[], bgp_consolidation=[], vrf=[], port_migration=[]):
         self.wb = Workbook()
         self.interconnect = interconnect
         self.ospf = ospf
         self.bgp = bgp
         self.bgp_consolidation = bgp_consolidation
+        self.vrf = vrf
+        self.port_migration = port_migration
         #self.interface_vlan = interface_vlan
     
     def steps(self):
@@ -210,9 +303,9 @@ class xportMop:
         self.node = list()
         if len(self.interconnect) > 0:
             node_A = [ x["node_A"] for x in self.interconnect ]
-            node_B = [ x["node_B"] for x in self.interconnect ]
+            #node_B = [ x["node_B"] for x in self.interconnect ]
             self.node += node_A
-            self.node += node_B
+            #self.node += node_B
             ws["A%s" % current_row] = current_phase
             ws["B%s" % current_row] = "Integration"
             for index, data in enumerate(self.interconnect):
@@ -234,9 +327,9 @@ class xportMop:
             ws["A%s" % current_row] = current_phase
             ws["B%s" % current_row] = "Enable OSPF"
             node_A = [ x["node_A"] for x in self.ospf ]
-            node_B = [ x["node_B"] for x in self.ospf ]
+            #node_B = [ x["node_B"] for x in self.ospf ]
             self.node += node_A
-            self.node += node_B
+            #self.node += node_B
             for index, data in enumerate(self.ospf):
                 field = dict()
                 current_row += 1
@@ -251,32 +344,13 @@ class xportMop:
             idx += 1
             current_phase = index_phase[idx]
             current_row += 1
-        if len(self.bgp_consolidation) > 0:
-            ws["A%s" % current_row] = current_phase
-            ws["B%s" % current_row] = "BGP peering"
-            node_A = [ x["node_A"] for x in self.ospf ]
-            self.node += node_A
-            for index, data in enumerate(self.bgp_consolidation):
-                field = dict()
-                current_row += 1
-                ws["A%s" % current_row] = field["phase"] = "%s%s" % (current_phase, index+1)
-                ws["B%s" % current_row] = field["activity"] = "BGP Peering on %s" % data["node_A"]
-                if len_column_B < len(field["activity"]):
-                    ws.column_dimensions["B"].width = len_column_B = len(field["activity"])
-                ws["C%s" % current_row] = "Downtime"
-                if len_column_C < len(ws["C%s" % current_row].value):
-                    ws.column_dimensions["C"].width = len_column_C = len(ws["C%s" % current_row].value)
-                result.append(field)
-            idx += 1
-            current_phase = index_phase[idx]
-            current_row += 1
         if len(self.bgp) > 0:
             ws["A%s" % current_row] = current_phase
             ws["B%s" % current_row] = "Create BGP"
             node_A = [ x["node_A"] for x in self.bgp ]
-            node_B = [ x["node_B"] for x in self.bgp ]
+            #node_B = [ x["node_B"] for x in self.bgp ]
             self.node += node_A
-            self.node += node_B
+            #self.node += node_B
             for index, data in enumerate(self.bgp):
                 field = dict()
                 current_row += 1
@@ -286,10 +360,72 @@ class xportMop:
                         ws["B%s" % current_row] = field["activity"] = "Enable eBGP %s to %s vrf %s" % (data["node_A"], data["node_B"], data["vrf"])
                         if len_column_B < len(field["activity"]):
                             ws.column_dimensions["B"].width = len_column_B = len(field["activity"])
+                    else:
+                        ws["A%s" % current_row] = field["phase"] = "%s%s" % (current_phase, index+1)
+                        ws["B%s" % current_row] = field["activity"] = "Enable BGP %s to %s vrf %s" % (data["node_A"], data["node_B"], data["vrf"])
+                        if len_column_B < len(field["activity"]):
+                            ws.column_dimensions["B"].width = len_column_B = len(field["activity"])      
                 ws["C%s" % current_row] = "No Downtime"
                 if len_column_C < len(ws["C%s" % current_row].value):
                     ws.column_dimensions["C"].width = len_column_C = len(ws["C%s" % current_row].value)  
-                result.append(field)              
+                result.append(field)
+            idx += 1
+            current_phase = index_phase[idx]
+            current_row += 1  
+        if len(self.vrf) > 0:
+            ws["A%s" % current_row] = current_phase
+            ws["B%s" % current_row] = "Add export and import VRF"
+            node_A = [ x["node"] for x in self.vrf ]
+            self.node += node_A
+            for index, data in enumerate(self.vrf):
+                record = dict()
+                current_row += 1
+                ws["A%s" % current_row] = record["phase"] = "%s%s" % (current_phase, index+1)
+                ws["B%s" % current_row] = record["activity"] = "Add export import vrf %s on %s" % (data["vrf_name"], data["node"])
+                if len_column_B < len(record["activity"]):
+                    ws.column_dimensions["B"].width = len_column_B = len(record["activity"])
+                ws["C%s" % current_row] = " No downtime"
+                if len_column_C < len(ws["C%s" % current_row].value):
+                    ws.column_dimensions["C"].width = len_column_C = len(ws["C%s" % current_row].value)
+                result.append(record)
+            idx += 1
+            current_phase = index_phase[idx]
+            current_row += 1   
+        if len(self.port_migration) > 0:
+            ws["A%s" % current_row] = current_phase
+            ws["B%s" % current_row] = "Port Migration"
+            node_A = [ x["node_A"] for x in self.port_migration ]
+            self.node += node_A
+            for index, data in enumerate(self.port_migration):
+                record = dict()
+                current_row += 1
+                ws["A%s" % current_row] = record["phase"] = "%s%s" % (current_phase, index+1)
+                ws["B%s" % current_row] = record["activity"] = "Port migration %s on %s" % (data["port_A"], data["node_A"])
+                if len_column_B < len(record["activity"]):
+                    ws.column_dimensions["B"].width = len_column_B = len(record["activity"])
+                ws["C%s" % current_row] = " Downtime"
+                if len_column_C < len(ws["C%s" % current_row].value):
+                    ws.column_dimensions["C"].width = len_column_C = len(ws["C%s" % current_row].value)
+                result.append(record)
+            idx += 1
+            current_phase = index_phase[idx]
+            current_row += 1
+        if len(self.bgp_consolidation) > 0:
+            ws["A%s" % current_row] = current_phase
+            ws["B%s" % current_row] = "BGP consolidation"
+            node_A = [ x["node_A"] for x in self.bgp_consolidation ]
+            self.node += node_A
+            for index, data in enumerate(self.bgp_consolidation):
+                field = dict()
+                current_row += 1
+                ws["A%s" % current_row] = field["phase"] = "%s%s" % (current_phase, index+1)
+                ws["B%s" % current_row] = field["activity"] = "BGP consolidation on %s" % data["node_A"]
+                if len_column_B < len(field["activity"]):
+                    ws.column_dimensions["B"].width = len_column_B = len(field["activity"])
+                ws["C%s" % current_row] = "Downtime"
+                if len_column_C < len(ws["C%s" % current_row].value):
+                    ws.column_dimensions["C"].width = len_column_C = len(ws["C%s" % current_row].value)
+                result.append(field)
         return result
     
     def script(self):
@@ -314,17 +450,43 @@ class xportMop:
             "integration" : [],
             "ospf" : [],
             "bgp" : [],
-            "bgp_consolidation" : []
+            "bgp_consolidation" : [],
+            "vrf" : [],
+            "port_migration" : []
         }
         for step in steps:
             if "P2P" in step["activity"]:
                 script["integration"].append(step)
             elif "OSPF" in step["activity"]:
                 script["ospf"].append(step)
-            elif "Peering" in step["activity"]:
+            elif "consolidation" in step["activity"]:
                 script["bgp_consolidation"].append(step)
             elif "BGP" in step["activity"]:
                 script["bgp"].append(step)
+            elif "export import" in step["activity"]:
+                script["vrf"].append(step)
+            elif "Port migration" in step["activity"]:
+                script["port_migration"].append(step)
+        if len(self.bgp) > 0:
+            node_name = None
+            for index, data in enumerate(script["bgp"]):
+                ws["A%s" % current_row] = data["phase"]
+                ws["B%s" % current_row] = data["activity"]
+                if len_column < len(data["activity"]):
+                    ws.column_dimensions["B"].width = len_column = len(data["activity"])
+                node_A = self.bgp[index]["node_A"]
+                bgp_script = str()
+                if node_A != node_name:
+                    node_name = node_A
+                    bgp_script += script_gen.bgp_main(self.bgp[index])
+                bgp_script += script_gen.bgp(self.bgp[index])
+                bgp_script = bgp_script.splitlines()
+                node_col = [ x["column"] for x in node_column if x["node"] == self.bgp[index]["node_A"]]
+                for s in bgp_script:
+                    ws["%s%s" % (node_col[0], current_row)] = s
+                    if len_column < len(s):
+                        ws.column_dimensions["%s" % node_col[0]].width = len_column = len(s)
+                    current_row += 1
         if len(self.interconnect) > 0:
             for index, data in enumerate(script["integration"]):
                 ws["A%s" % current_row] = data["phase"]
@@ -354,6 +516,44 @@ class xportMop:
                     if len_column < len(s):
                         ws.column_dimensions["%s" % node_col[0]].width = len_column = len(s)
                     current_row += 1
+        if len(self.vrf) > 0:
+            for index, data in enumerate(script["vrf"]):
+                ws["A%s" % current_row] = data["phase"]
+                ws["B%s" % current_row] = data["activity"]
+                if len_column < len(data["activity"]):
+                    ws.column_dimensions["B"].width = len_column = len(data["activity"])
+                else:
+                    ws.column_dimensions["B"].width = len_column
+                vrf_script = script_gen.vrf(self.vrf[index])
+                vrf_script = vrf_script.splitlines()
+                node_col = [ x["column"] for x in node_column if x["node"] == self.vrf[index]["node"]]
+                for s in vrf_script:
+                    ws["%s%s" % (node_col[0], current_row)] = s
+                    #print(len_column)
+                    if len_column < len(s):
+                        ws.column_dimensions["%s" % node_col[0]].width = len_column = len(s)
+                    else:
+                        ws.column_dimensions["%s" % node_col[0]].width = len_column
+                    current_row += 1
+        if len(self.port_migration) > 0:
+            for index, data in enumerate(script["port_migration"]):
+                ws["A%s" % current_row] = data["phase"]
+                ws["B%s" % current_row] = data["activity"]
+                if len_column < len(data["activity"]):
+                    ws.column_dimensions["B"].width = len_column = len(data["activity"])
+                else:
+                    ws.column_dimensions["B"].width = len_column
+                vrf_script = script_gen.port_migration(self.port_migration[index])
+                vrf_script = vrf_script.splitlines()
+                node_col = [ x["column"] for x in node_column if x["node"] == self.port_migration[index]["node_A"]]
+                for s in vrf_script:
+                    ws["%s%s" % (node_col[0], current_row)] = s
+                    #print(len_column)
+                    if len_column < len(s):
+                        ws.column_dimensions["%s" % node_col[0]].width = len_column = len(s)
+                    else:
+                        ws.column_dimensions["%s" % node_col[0]].width = len_column
+                    current_row += 1
         if len(self.bgp_consolidation) > 0:
             #pprint(self.bgp_consolidation)
             for index, data in enumerate(script["bgp_consolidation"]):
@@ -364,31 +564,15 @@ class xportMop:
                 bgp_consol_script = script_gen.bgp_consol(self.bgp_consolidation[index])
                 bgp_consol_script = bgp_consol_script.splitlines()
                 node_col = [ x["column"] for x in node_column if x["node"] == self.bgp_consolidation[index]["node_A"]]
+                #print(node_col[0])
                 for s in bgp_consol_script:
                     ws["%s%s" % (node_col[0], current_row)] = s
+                    #print(len_column)
                     if len_column < len(s):
                         ws.column_dimensions["%s" % node_col[0]].width = len_column = len(s)
-                    current_row += 1               
-        if len(self.bgp) > 0:
-            node_name = None
-            for index, data in enumerate(script["bgp"]):
-                ws["A%s" % current_row] = data["phase"]
-                ws["B%s" % current_row] = data["activity"]
-                if len_column < len(data["activity"]):
-                    ws.column_dimensions["B"].width = len_column = len(data["activity"])
-                node_A = self.bgp[index]["node_A"]
-                bgp_script = str()
-                if node_A != node_name:
-                    node_name = node_A
-                    bgp_script += script_gen.bgp_main(self.bgp[index])
-                bgp_script += script_gen.bgp(self.bgp[index])
-                bgp_script = bgp_script.splitlines()
-                node_col = [ x["column"] for x in node_column if x["node"] == self.bgp[index]["node_A"]]
-                for s in bgp_script:
-                    ws["%s%s" % (node_col[0], current_row)] = s
-                    if len_column < len(s):
-                        ws.column_dimensions["%s" % node_col[0]].width = len_column = len(s)
-                    current_row += 1
+                    else:
+                        ws.column_dimensions["%s" % node_col[0]].width = len_column
+                    current_row += 1  
         return script
 
     def save(self, name):
@@ -401,6 +585,10 @@ def main():
     ospf_data = database.ospfDB()
     bgp_data = database.bgpDB()
     bgp_consol_data = database.bgpConsolidationDB()
+    port_data = database.portMigrationDB()
+    vrf_data = database.vrfDB()
+    print("=========================================== VRF =================================================================")
+    pprint(vrf_data)
     print("=========================================== Integration =========================================================")
     pprint(interconnect_data)
     print("=========================================== OSPF ================================================================")
@@ -408,6 +596,8 @@ def main():
     print("=========================================== BGP =================================================================")
     pprint(bgp_consol_data)
     pprint(bgp_data)
+    print("=========================================== Port migration ======================================================")
+    pprint(port_data)
     print("=========================================== Generate script =====================================================")
     for data in interconnect_data:
         script1 = scriptGenerator().interconnect(data)
@@ -420,7 +610,11 @@ def main():
     for data in bgp_consol_data:
         script4 = scriptGenerator().bgp_consol(data)
         print(script4)
-    create_mop = xportMop(interconnect=interconnect_data, ospf=ospf_data, bgp=bgp_data, bgp_consolidation=bgp_consol_data)
+    create_mop = xportMop(  interconnect=interconnect_data, 
+                            ospf=ospf_data, bgp=bgp_data, 
+                            bgp_consolidation=bgp_consol_data, 
+                            vrf=vrf_data,
+                            port_migration=port_data)
     print("=========================================== Create MoP =========================================================")
     pprint(create_mop.script())
     #create_mop.script()
